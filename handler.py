@@ -1,9 +1,7 @@
 import base64
 import json
 import logging
-import os
 import re
-import shutil
 import time
 from io import BytesIO
 from pathlib import Path
@@ -33,21 +31,6 @@ from docling_core.types.doc import ImageRefMode
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-
-_RUNPOD_HF_CACHE_ROOT = Path("/runpod-volume/huggingface-cache/hub")
-_RUNPOD_HF_CACHE_ROOT_ENV = "RUNPOD_HF_CACHE_ROOT"
-_RUNPOD_MODEL_ENV_KEYS = (
-	"MODEL_NAME",
-	"RUNPOD_MODEL_NAME",
-	"RUNPOD_MODEL_ID",
-	"HF_MODEL_ID",
-)
-_ARTIFACTS_OVERLAY_ROOT = Path("/tmp/docling-artifacts-overlays")
-_DOCLING_ARTIFACTS_ENV_KEYS = (
-	"DOCLING_SERVE_ARTIFACTS_PATH",
-	"DOCLING_ARTIFACTS_PATH",
-)
 
 
 _FORMAT_ALIASES = {
@@ -137,209 +120,17 @@ def _as_path_or_none(value: Any) -> Path | None:
 	return Path(text).expanduser()
 
 
-def _resolve_default_artifacts_path() -> Path | None:
-	for env_key in _DOCLING_ARTIFACTS_ENV_KEYS:
-		raw = os.environ.get(env_key)
-		path = _as_path_or_none(raw)
-		if path is None:
-			continue
-		if path.is_dir():
-			return path
-		logger.warning("Ignoring %s=%s because it is not a directory.", env_key, path)
-	return None
-
-
-def _resolve_cached_model_id(options: dict[str, Any]) -> str | None:
-	from_options = _first_non_empty(
-		[
-			options.get("cached_model_id"),
-			options.get("model_id"),
-			options.get("model"),
-			options.get("hf_model_id"),
-		]
-	)
-	if from_options is not None:
-		return from_options
-
-	for env_key in _RUNPOD_MODEL_ENV_KEYS:
-		value = _first_non_empty([os.environ.get(env_key)])
-		if value is not None:
-			return value
-
-	return None
-
-
-def _resolve_runpod_cached_snapshot(
-	model_id: str,
-	cache_root: Path,
-	revision: str = "main",
-) -> Path | None:
-	if "/" not in model_id:
-		logger.warning("Cached model id '%s' is not in 'org/name' format.", model_id)
-		return None
-
-	model_root = cache_root / f"models--{model_id.replace('/', '--')}"
-	if not model_root.is_dir():
-		return None
-
-	snapshots_dir = model_root / "snapshots"
-	refs_file = model_root / "refs" / revision
-	if refs_file.is_file() and snapshots_dir.is_dir():
-		snapshot_hash = refs_file.read_text(encoding="utf-8").strip()
-		if snapshot_hash:
-			candidate = snapshots_dir / snapshot_hash
-			if candidate.is_dir():
-				return candidate
-
-	if snapshots_dir.is_dir():
-		snapshots = sorted(p for p in snapshots_dir.iterdir() if p.is_dir())
-		if snapshots:
-			return snapshots[0]
-
-	return None
-
-
-def _infer_repo_cache_folder_from_snapshot(snapshot_path: Path) -> str | None:
-	for parent in snapshot_path.parents:
-		if parent.name.startswith("models--"):
-			repo_cache_folder = parent.name.removeprefix("models--")
-			return repo_cache_folder or None
-	return None
-
-
-def _link_or_copy(source: Path, destination: Path) -> None:
-	try:
-		destination.symlink_to(source, target_is_directory=source.is_dir())
-	except OSError:
-		if source.is_dir():
-			shutil.copytree(source, destination, dirs_exist_ok=True)
-		else:
-			shutil.copy2(source, destination)
-
-
-def _build_artifacts_overlay(
-	base_artifacts: Path | None,
-	repo_cache_folder: str,
-	snapshot_path: Path,
-) -> Path:
-	_ARTIFACTS_OVERLAY_ROOT.mkdir(parents=True, exist_ok=True)
-	overlay_dir = _ARTIFACTS_OVERLAY_ROOT / _sanitize_name(repo_cache_folder, "model")
-	overlay_dir.mkdir(parents=True, exist_ok=True)
-
-	if base_artifacts is not None and base_artifacts.is_dir():
-		for child in base_artifacts.iterdir():
-			link_path = overlay_dir / child.name
-			if link_path.exists() or link_path.is_symlink():
-				continue
-			_link_or_copy(child, link_path)
-
-	model_link = overlay_dir / repo_cache_folder
-	if model_link.is_symlink():
-		if model_link.resolve() != snapshot_path.resolve():
-			model_link.unlink(missing_ok=True)
-	elif model_link.exists():
-		if model_link.is_dir():
-			shutil.rmtree(model_link)
-		else:
-			model_link.unlink(missing_ok=True)
-
-	if not model_link.exists():
-		_link_or_copy(snapshot_path, model_link)
-
-	return overlay_dir
-
-
 def _resolve_artifacts_path(options: dict[str, Any]) -> Path | None:
 	explicit_artifacts = _as_path_or_none(
 		_first_non_empty([options.get("artifacts_path"), options.get("model_artifacts_path")])
 	)
-	if explicit_artifacts is not None:
-		if not explicit_artifacts.is_dir():
-			raise ValueError(
-				f"Invalid artifacts path '{explicit_artifacts}'. It must be an existing directory."
-			)
-		base_artifacts = explicit_artifacts
-	else:
-		base_artifacts = _resolve_default_artifacts_path()
-
-	use_runpod_cache = _as_bool(options.get("use_runpod_cached_model"), True)
-	if not use_runpod_cache:
-		return base_artifacts
-
-	revision = str(options.get("cached_model_revision", "main")).strip() or "main"
-	cache_root = _as_path_or_none(options.get("runpod_cache_root")) or _as_path_or_none(
-		os.environ.get(_RUNPOD_HF_CACHE_ROOT_ENV)
-	)
-	if cache_root is None:
-		cache_root = _RUNPOD_HF_CACHE_ROOT
-
-	explicit_snapshot = _as_path_or_none(
-		_first_non_empty(
-			[
-				options.get("cached_model_snapshot_path"),
-				options.get("runpod_cached_model_path"),
-				os.environ.get("RUNPOD_MODEL_PATH"),
-			]
+	if explicit_artifacts is None:
+		return None
+	if not explicit_artifacts.is_dir():
+		raise ValueError(
+			f"Invalid artifacts path '{explicit_artifacts}'. It must be an existing directory."
 		)
-	)
-
-	snapshot_path: Path | None = None
-	repo_cache_folder: str | None = None
-
-	if explicit_snapshot is not None:
-		candidate = explicit_snapshot
-		if (candidate / "snapshots").is_dir():
-			refs_main = candidate / "refs" / revision
-			snapshots_dir = candidate / "snapshots"
-			if refs_main.is_file():
-				hash_value = refs_main.read_text(encoding="utf-8").strip()
-				resolved = snapshots_dir / hash_value
-				if resolved.is_dir():
-					candidate = resolved
-			if candidate == explicit_snapshot:
-				snapshots = sorted(p for p in snapshots_dir.iterdir() if p.is_dir())
-				if snapshots:
-					candidate = snapshots[0]
-		if candidate.is_dir():
-			snapshot_path = candidate
-			repo_cache_folder = _infer_repo_cache_folder_from_snapshot(candidate)
-
-	if snapshot_path is None:
-		cached_model_id = _resolve_cached_model_id(options)
-		if cached_model_id is None:
-			return base_artifacts
-		repo_cache_folder = cached_model_id.replace("/", "--")
-		snapshot_path = _resolve_runpod_cached_snapshot(
-			model_id=cached_model_id,
-			cache_root=cache_root,
-			revision=revision,
-		)
-		if snapshot_path is None:
-			logger.info(
-				"Runpod cached model '%s' was not found under '%s'; using default artifacts path.",
-				cached_model_id,
-				cache_root,
-			)
-			return base_artifacts
-
-	if repo_cache_folder is None:
-		logger.warning(
-			"Could not infer repository folder name from snapshot path '%s'; using default artifacts path.",
-			snapshot_path,
-		)
-		return base_artifacts
-
-	overlay = _build_artifacts_overlay(
-		base_artifacts=base_artifacts,
-		repo_cache_folder=repo_cache_folder,
-		snapshot_path=snapshot_path,
-	)
-	logger.info(
-		"Using Runpod cached model snapshot '%s' via artifacts overlay '%s'.",
-		snapshot_path,
-		overlay,
-	)
-	return overlay
+	return explicit_artifacts
 
 
 def _normalize_sources(payload: dict[str, Any]) -> list[dict[str, Any]]:

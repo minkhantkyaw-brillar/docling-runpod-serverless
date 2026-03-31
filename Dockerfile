@@ -1,4 +1,5 @@
 FROM ghcr.io/docling-project/docling-serve:latest
+RUN docling-tools models download --all
 RUN pip install --no-cache-dir runpod requests pyyaml
 
 WORKDIR /app
