@@ -44,6 +44,27 @@ _NO_IMAGE_EXPORT_FORMATS = {
 	OutputFormat.DOCTAGS.value,
 	OutputFormat.VTT.value,
 }
+_TARGET_KIND_ALIASES = {
+	"in_body": "inbody",
+	"in-body": "inbody",
+	"file": "base64",
+	"file_base64": "base64",
+	"base64_file": "base64",
+}
+_BASE64_EXPORT_META = {
+	OutputFormat.MARKDOWN.value: ("md_content", "md", "text/markdown; charset=utf-8"),
+	OutputFormat.JSON.value: ("json_content", "json", "application/json"),
+	OutputFormat.YAML.value: ("yaml_content", "yaml", "application/x-yaml"),
+	OutputFormat.HTML.value: ("html_content", "html", "text/html; charset=utf-8"),
+	OutputFormat.HTML_SPLIT_PAGE.value: (
+		"html_split_page_content",
+		"html",
+		"text/html; charset=utf-8",
+	),
+	OutputFormat.TEXT.value: ("text_content", "txt", "text/plain; charset=utf-8"),
+	OutputFormat.DOCTAGS.value: ("doctags_content", "doctags", "text/plain; charset=utf-8"),
+	OutputFormat.VTT.value: ("vtt_content", "vtt", "text/vtt; charset=utf-8"),
+}
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -154,11 +175,12 @@ def _normalize_sources(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _normalize_target_kind(payload: dict[str, Any]) -> str:
 	target = payload.get("target", {"kind": "inbody"})
+	kind = "inbody"
 	if isinstance(target, str):
-		return target.lower()
+		kind = target.lower()
 	if isinstance(target, dict):
-		return str(target.get("kind", "inbody")).lower()
-	return "inbody"
+		kind = str(target.get("kind", "inbody")).lower()
+	return _TARGET_KIND_ALIASES.get(kind, kind)
 
 
 def _normalize_image_mode(raw: Any) -> ImageRefMode:
@@ -405,6 +427,34 @@ def _export_document(document: Any, to_formats: list[str], image_mode: ImageRefM
 	return content
 
 
+def _build_single_base64_result(item: dict[str, Any], output_format: str) -> dict[str, Any]:
+	meta = _BASE64_EXPORT_META.get(output_format)
+	if meta is None:
+		raise ValueError(f"Output format '{output_format}' cannot be exported as a single base64 file.")
+
+	content_key, extension, content_type = meta
+	document = item.get("document", {})
+	content = document.get(content_key)
+	if content is None:
+		raise ValueError(f"No content available for format '{output_format}'.")
+
+	if content_key == "json_content":
+		text_payload = json.dumps(content, ensure_ascii=True, indent=2)
+	elif isinstance(content, str):
+		text_payload = content
+	else:
+		text_payload = str(content)
+
+	filename = f"{item.get('name', 'document')}.{extension}"
+	return {
+		"kind": "base64",
+		"format": output_format,
+		"content_type": content_type,
+		"filename": filename,
+		"file_base64": base64.b64encode(text_payload.encode("utf-8")).decode("ascii"),
+	}
+
+
 def _source_failure(name: str, message: str) -> dict[str, Any]:
 	return {
 		"name": name,
@@ -503,6 +553,12 @@ def process_request(payload: dict[str, Any]) -> dict[str, Any]:
 	target_kind = _normalize_target_kind(payload)
 	abort_on_error = _as_bool(options.get("abort_on_error"), False)
 
+	if target_kind == "base64" and len(sources) != 1:
+		raise ValueError("target.kind='base64' requires exactly one source.")
+
+	if target_kind == "base64" and len(to_formats) != 1:
+		raise ValueError("target.kind='base64' requires exactly one format in options.to_formats.")
+
 	converter = _build_converter(options=options, to_formats=to_formats)
 
 	page_range = options.get("page_range")
@@ -577,6 +633,21 @@ def process_request(payload: dict[str, Any]) -> dict[str, Any]:
 
 	processing_time = round(time.time() - started, 6)
 	overall_status = _status_summary(results)
+
+	if target_kind == "base64":
+		only = results[0]
+		response: dict[str, Any] = {
+			"status": only["status"],
+			"processing_time": processing_time,
+			"timings": only.get("timings", {}),
+			"errors": only.get("errors", []),
+		}
+		if only.get("status") != "failure":
+			response["result"] = _build_single_base64_result(
+				item=only,
+				output_format=to_formats[0],
+			)
+		return response
 
 	# Mimic /v1/convert/source in-body response whenever we have exactly one source
 	# and the target is not zip.
