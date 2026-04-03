@@ -51,6 +51,7 @@ _TARGET_KIND_ALIASES = {
 	"file_base64": "base64",
 	"base64_file": "base64",
 }
+_EXTRACTION_ALLOWED_FORMATS = [InputFormat.IMAGE, InputFormat.PDF]
 _BASE64_EXPORT_META = {
 	OutputFormat.MARKDOWN.value: ("md_content", "md", "text/markdown; charset=utf-8"),
 	OutputFormat.JSON.value: ("json_content", "json", "application/json"),
@@ -188,6 +189,62 @@ def _normalize_image_mode(raw: Any) -> ImageRefMode:
 	if mode not in {m.value for m in ImageRefMode}:
 		mode = ImageRefMode.PLACEHOLDER.value
 	return ImageRefMode(mode)
+
+
+def _normalize_extraction_options(options: dict[str, Any]) -> dict[str, Any]:
+	extraction_options = options.get("extraction")
+	if extraction_options is None:
+		extraction_options = {}
+	if not isinstance(extraction_options, dict):
+		raise ValueError("'options.extraction' must be an object.")
+
+	enabled_raw = _first_non_empty(
+		[
+			extraction_options.get("enabled"),
+			options.get("do_extraction"),
+			options.get("do_information_extraction"),
+		]
+	)
+	enabled = _as_bool(enabled_raw, False)
+	if not enabled:
+		return {"enabled": False, "template": None}
+
+	template = extraction_options.get("template", options.get("extraction_template"))
+	if template is None:
+		raise ValueError(
+			"Information extraction requires 'options.extraction.template' or "
+			"'options.extraction_template'."
+		)
+
+	if isinstance(template, str):
+		template = template.strip()
+		if not template:
+			raise ValueError("Extraction template string cannot be empty.")
+	elif not isinstance(template, dict):
+		raise ValueError("Extraction template must be a string or object.")
+
+	return {
+		"enabled": True,
+		"template": template,
+	}
+
+
+def _build_extractor() -> Any:
+	try:
+		from docling.document_extractor import DocumentExtractor
+	except Exception as exc:
+		raise RuntimeError(
+			"Information extraction is unavailable in this environment. "
+			"Install Docling with extraction/VLM support."
+		) from exc
+
+	return DocumentExtractor(allowed_formats=_EXTRACTION_ALLOWED_FORMATS)
+
+
+def _rewind_source_input(source_input: Any) -> None:
+	stream = getattr(source_input, "stream", None)
+	if hasattr(stream, "seek"):
+		stream.seek(0)
 
 
 def _sanitize_name(name: str, fallback: str) -> str:
@@ -455,8 +512,40 @@ def _build_single_base64_result(item: dict[str, Any], output_format: str) -> dic
 	}
 
 
-def _source_failure(name: str, message: str) -> dict[str, Any]:
+def _extract_information(
+	*,
+	extractor: Any,
+	source_input: Any,
+	headers: dict[str, str] | None,
+	template: str | dict[str, Any],
+	extract_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+	_rewind_source_input(source_input)
+	result = extractor.extract(
+		source=source_input,
+		headers=headers,
+		template=template,
+		**extract_kwargs,
+	)
+
+	status = str(getattr(result.status, "value", result.status)).lower()
 	return {
+		"status": status,
+		"pages": _jsonable(getattr(result, "pages", [])),
+		"errors": _jsonable(getattr(result, "errors", [])),
+	}
+
+
+def _extraction_failure(message: str) -> dict[str, Any]:
+	return {
+		"status": "failure",
+		"pages": [],
+		"errors": [{"error_message": message}],
+	}
+
+
+def _source_failure(name: str, message: str, extraction_error: str | None = None) -> dict[str, Any]:
+	failure: dict[str, Any] = {
 		"name": name,
 		"document": {
 			"md_content": None,
@@ -473,6 +562,9 @@ def _source_failure(name: str, message: str) -> dict[str, Any]:
 		"timings": {},
 		"errors": [{"error_message": message}],
 	}
+	if extraction_error is not None:
+		failure["extraction"] = _extraction_failure(extraction_error)
+	return failure
 
 
 def _status_summary(results: list[dict[str, Any]]) -> str:
@@ -497,6 +589,7 @@ def _write_zip_payload(results: list[dict[str, Any]]) -> str:
 		for item in results:
 			base = item["name"]
 			document = item.get("document", {})
+			extraction = item.get("extraction")
 			status = item.get("status", "unknown")
 
 			if status != "failure":
@@ -523,11 +616,18 @@ def _write_zip_payload(results: list[dict[str, Any]]) -> str:
 				if document.get("vtt_content") is not None:
 					zf.writestr(f"{base}.vtt", document["vtt_content"])
 
+			if isinstance(extraction, dict):
+				zf.writestr(
+					f"{base}.extraction.json",
+					json.dumps(extraction, ensure_ascii=True, indent=2),
+				)
+
 			manifest.append(
 				{
 					"name": base,
 					"status": status,
 					"processing_time": item.get("processing_time", 0.0),
+					"extraction_status": extraction.get("status") if isinstance(extraction, dict) else None,
 					"errors": item.get("errors", []),
 				}
 			)
@@ -552,6 +652,9 @@ def process_request(payload: dict[str, Any]) -> dict[str, Any]:
 	image_mode = _normalize_image_mode(options.get("image_export_mode"))
 	target_kind = _normalize_target_kind(payload)
 	abort_on_error = _as_bool(options.get("abort_on_error"), False)
+	extraction_options = _normalize_extraction_options(options)
+	extraction_enabled = extraction_options["enabled"]
+	extraction_template = extraction_options["template"]
 
 	if target_kind == "base64" and len(sources) != 1:
 		raise ValueError("target.kind='base64' requires exactly one source.")
@@ -560,6 +663,7 @@ def process_request(payload: dict[str, Any]) -> dict[str, Any]:
 		raise ValueError("target.kind='base64' requires exactly one format in options.to_formats.")
 
 	converter = _build_converter(options=options, to_formats=to_formats)
+	extractor = _build_extractor() if extraction_enabled else None
 
 	page_range = options.get("page_range")
 	convert_kwargs: dict[str, Any] = {"raises_on_error": False}
@@ -576,6 +680,8 @@ def process_request(payload: dict[str, Any]) -> dict[str, Any]:
 	max_file_size = _as_int(options.get("max_file_size"), None)
 	if max_file_size is not None:
 		convert_kwargs["max_file_size"] = max_file_size
+
+	extract_kwargs = dict(convert_kwargs)
 
 	results: list[dict[str, Any]] = []
 
@@ -618,6 +724,19 @@ def process_request(payload: dict[str, Any]) -> dict[str, Any]:
 					image_mode=image_mode,
 				)
 
+			if extraction_enabled and extractor is not None and extraction_template is not None:
+				try:
+					source_response["extraction"] = _extract_information(
+						extractor=extractor,
+						source_input=source_input,
+						headers=headers,
+						template=extraction_template,
+						extract_kwargs=extract_kwargs,
+					)
+				except Exception as exc:
+					logger.exception("Failed extracting information for source %s", name)
+					source_response["extraction"] = _extraction_failure(str(exc))
+
 			results.append(source_response)
 
 			if abort_on_error and status == "failure":
@@ -625,7 +744,11 @@ def process_request(payload: dict[str, Any]) -> dict[str, Any]:
 
 		except Exception as exc:
 			logger.exception("Failed processing source %s", name)
-			fail_response = _source_failure(name=name, message=str(exc))
+			fail_response = _source_failure(
+				name=name,
+				message=str(exc),
+				extraction_error=str(exc) if extraction_enabled else None,
+			)
 			fail_response["processing_time"] = round(time.time() - source_start, 6)
 			results.append(fail_response)
 			if abort_on_error:
@@ -642,6 +765,8 @@ def process_request(payload: dict[str, Any]) -> dict[str, Any]:
 			"timings": only.get("timings", {}),
 			"errors": only.get("errors", []),
 		}
+		if "extraction" in only:
+			response["extraction"] = only["extraction"]
 		if only.get("status") != "failure":
 			response["result"] = _build_single_base64_result(
 				item=only,
@@ -653,13 +778,16 @@ def process_request(payload: dict[str, Any]) -> dict[str, Any]:
 	# and the target is not zip.
 	if len(results) == 1 and target_kind != "zip":
 		only = results[0]
-		return {
+		response = {
 			"document": only["document"],
 			"status": only["status"],
 			"processing_time": processing_time,
 			"timings": only.get("timings", {}),
 			"errors": only.get("errors", []),
 		}
+		if "extraction" in only:
+			response["extraction"] = only["extraction"]
+		return response
 
 	zip_b64 = _write_zip_payload(results)
 
