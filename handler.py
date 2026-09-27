@@ -1,835 +1,220 @@
+"""RunPod JSON adapter for the bundled Docling Serve asynchronous conversion API."""
+
+import atexit
 import base64
+import importlib
+import importlib.metadata
 import json
 import logging
-import re
+import os
+import signal
+import subprocess
+import sys
+import threading
 import time
-from io import BytesIO
-from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import Any
-from urllib.parse import urlparse
-from zipfile import ZIP_DEFLATED, ZipFile
-
-import runpod
-import yaml
-from docling.backend.docling_parse_backend import DoclingParseDocumentBackend
-from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
-from docling.datamodel.base_models import DocumentStream, InputFormat, OutputFormat
-from docling.datamodel.pipeline_options import (
-	PdfBackend,
-	PdfPipelineOptions,
-	TableFormerMode,
-	TableStructureOptions,
-	TesseractCliOcrOptions,
-	TesseractOcrOptions,
-	normalize_pdf_backend,
-)
-from docling.document_converter import DocumentConverter, ImageFormatOption, PdfFormatOption
-from docling.models.factories import get_ocr_factory
-from docling_core.types.doc import ImageRefMode
-
-
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
-
-
-_FORMAT_ALIASES = {
-	"markdown": "md",
-	"txt": "text",
-	"htm": "html",
-}
-_ALLOWED_OUTPUT_FORMATS = {fmt.value for fmt in OutputFormat}
-_NO_IMAGE_EXPORT_FORMATS = {
-	OutputFormat.TEXT.value,
-	OutputFormat.DOCTAGS.value,
-	OutputFormat.VTT.value,
-}
-_TARGET_KIND_ALIASES = {
-	"in_body": "inbody",
-	"in-body": "inbody",
-	"file": "base64",
-	"file_base64": "base64",
-	"base64_file": "base64",
-}
-_EXTRACTION_ALLOWED_FORMATS = [InputFormat.IMAGE, InputFormat.PDF]
-_BASE64_EXPORT_META = {
-	OutputFormat.MARKDOWN.value: ("md_content", "md", "text/markdown; charset=utf-8"),
-	OutputFormat.JSON.value: ("json_content", "json", "application/json"),
-	OutputFormat.YAML.value: ("yaml_content", "yaml", "application/x-yaml"),
-	OutputFormat.HTML.value: ("html_content", "html", "text/html; charset=utf-8"),
-	OutputFormat.HTML_SPLIT_PAGE.value: (
-		"html_split_page_content",
-		"html",
-		"text/html; charset=utf-8",
-	),
-	OutputFormat.TEXT.value: ("text_content", "txt", "text/plain; charset=utf-8"),
-	OutputFormat.DOCTAGS.value: ("doctags_content", "doctags", "text/plain; charset=utf-8"),
-	OutputFormat.VTT.value: ("vtt_content", "vtt", "text/vtt; charset=utf-8"),
-}
-
-
-def _as_bool(value: Any, default: bool) -> bool:
-	if value is None:
-		return default
-	if isinstance(value, bool):
-		return value
-	if isinstance(value, str):
-		return value.strip().lower() in {"1", "true", "yes", "on"}
-	return bool(value)
-
-
-def _as_float(value: Any, default: float | None = None) -> float | None:
-	if value is None:
-		return default
-	try:
-		return float(value)
-	except (TypeError, ValueError):
-		return default
-
-
-def _as_int(value: Any, default: int | None = None) -> int | None:
-	if value is None:
-		return default
-	try:
-		return int(value)
-	except (TypeError, ValueError):
-		return default
-
-
-def _as_list_of_str(value: Any) -> list[str] | None:
-	if value is None:
-		return None
-	if isinstance(value, str):
-		items = [part.strip() for part in re.split(r"[;,]", value) if part.strip()]
-		return items or None
-	if isinstance(value, list):
-		items = [str(item).strip() for item in value if str(item).strip()]
-		return items or None
-	return None
-
-
-def _normalize_output_formats(value: Any) -> list[str]:
-	raw_formats = _as_list_of_str(value) or [OutputFormat.MARKDOWN.value]
-	normalized: list[str] = []
-
-	for fmt in raw_formats:
-		key = _FORMAT_ALIASES.get(fmt.lower(), fmt.lower())
-		if key in _ALLOWED_OUTPUT_FORMATS and key not in normalized:
-			normalized.append(key)
-
-	if not normalized:
-		normalized = [OutputFormat.MARKDOWN.value]
-
-	return normalized
-
-
-def _first_non_empty(values: list[Any]) -> str | None:
-	for value in values:
-		if value is None:
-			continue
-		text = str(value).strip()
-		if text:
-			return text
-	return None
-
-
-def _as_path_or_none(value: Any) -> Path | None:
-	if value is None:
-		return None
-	text = str(value).strip()
-	if not text:
-		return None
-	return Path(text).expanduser()
-
-
-def _resolve_artifacts_path(options: dict[str, Any]) -> Path | None:
-	explicit_artifacts = _as_path_or_none(
-		_first_non_empty([options.get("artifacts_path"), options.get("model_artifacts_path")])
-	)
-	if explicit_artifacts is None:
-		return None
-	if not explicit_artifacts.is_dir():
-		raise ValueError(
-			f"Invalid artifacts path '{explicit_artifacts}'. It must be an existing directory."
-		)
-	return explicit_artifacts
-
-
-def _normalize_sources(payload: dict[str, Any]) -> list[dict[str, Any]]:
-	if isinstance(payload.get("sources"), list) and payload["sources"]:
-		return payload["sources"]
-
-	sources: list[dict[str, Any]] = []
-
-	for item in payload.get("http_sources", []) or []:
-		source = dict(item)
-		source.setdefault("kind", "http")
-		sources.append(source)
-
-	for item in payload.get("file_sources", []) or []:
-		source = dict(item)
-		source.setdefault("kind", "file")
-		sources.append(source)
-
-	return sources
-
-
-def _normalize_target_kind(payload: dict[str, Any]) -> str:
-	target = payload.get("target", {"kind": "inbody"})
-	kind = "inbody"
-	if isinstance(target, str):
-		kind = target.lower()
-	if isinstance(target, dict):
-		kind = str(target.get("kind", "inbody")).lower()
-	return _TARGET_KIND_ALIASES.get(kind, kind)
-
-
-def _normalize_image_mode(raw: Any) -> ImageRefMode:
-	mode = str(raw or ImageRefMode.PLACEHOLDER.value).lower()
-	if mode not in {m.value for m in ImageRefMode}:
-		mode = ImageRefMode.PLACEHOLDER.value
-	return ImageRefMode(mode)
-
-
-def _normalize_extraction_options(options: dict[str, Any]) -> dict[str, Any]:
-	extraction_options = options.get("extraction")
-	if extraction_options is None:
-		extraction_options = {}
-	if not isinstance(extraction_options, dict):
-		raise ValueError("'options.extraction' must be an object.")
-
-	enabled_raw = _first_non_empty(
-		[
-			extraction_options.get("enabled"),
-			options.get("do_extraction"),
-			options.get("do_information_extraction"),
-		]
-	)
-	enabled = _as_bool(enabled_raw, False)
-	if not enabled:
-		return {"enabled": False, "template": None}
-
-	template = extraction_options.get("template", options.get("extraction_template"))
-	if template is None:
-		raise ValueError(
-			"Information extraction requires 'options.extraction.template' or "
-			"'options.extraction_template'."
-		)
-
-	if isinstance(template, str):
-		template = template.strip()
-		if not template:
-			raise ValueError("Extraction template string cannot be empty.")
-	elif not isinstance(template, dict):
-		raise ValueError("Extraction template must be a string or object.")
-
-	return {
-		"enabled": True,
-		"template": template,
-	}
-
-
-def _build_extractor() -> Any:
-	try:
-		from docling.document_extractor import DocumentExtractor
-	except Exception as exc:
-		raise RuntimeError(
-			"Information extraction is unavailable in this environment. "
-			"Install Docling with extraction/VLM support."
-		) from exc
-
-	return DocumentExtractor(allowed_formats=_EXTRACTION_ALLOWED_FORMATS)
-
-
-def _rewind_source_input(source_input: Any) -> None:
-	stream = getattr(source_input, "stream", None)
-	if hasattr(stream, "seek"):
-		stream.seek(0)
-
-
-def _sanitize_name(name: str, fallback: str) -> str:
-	safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
-	return safe or fallback
-
-
-def _source_name(source: dict[str, Any], index: int) -> str:
-	kind = str(source.get("kind", "")).lower()
-
-	if kind == "file":
-		filename = source.get("filename") or f"source_{index}"
-		stem = Path(str(filename)).stem
-		return _sanitize_name(stem, f"source_{index}")
-
-	if kind == "http":
-		raw_url = str(source.get("url", ""))
-		parsed = urlparse(raw_url)
-		candidate = Path(parsed.path).stem or parsed.netloc or f"source_{index}"
-		return _sanitize_name(candidate, f"source_{index}")
-
-	return _sanitize_name(f"source_{index}", f"source_{index}")
-
-
-def _prepare_source(source: dict[str, Any], index: int) -> tuple[Any, dict[str, str] | None, str]:
-	kind = str(source.get("kind", "")).lower()
-	name = _source_name(source, index)
-
-	if kind == "http":
-		url = source.get("url")
-		if not url:
-			raise ValueError("HTTP source requires a non-empty 'url'.")
-		headers = source.get("headers")
-		if headers is not None and not isinstance(headers, dict):
-			raise ValueError("Source headers must be a dictionary.")
-		return str(url), headers, name
-
-	if kind == "file":
-		b64 = source.get("base64_string")
-		if not b64:
-			raise ValueError("File source requires a non-empty 'base64_string'.")
-
-		b64_text = str(b64)
-		if b64_text.startswith("data:") and "," in b64_text:
-			b64_text = b64_text.split(",", 1)[1]
-
-		decoded = base64.b64decode(b64_text)
-		filename = source.get("filename") or f"{name}.bin"
-		stream = DocumentStream(name=str(filename), stream=BytesIO(decoded))
-		return stream, None, name
-
-	raise ValueError(f"Unsupported source kind: {kind!r}")
-
-
-def _jsonable(value: Any) -> Any:
-	if hasattr(value, "model_dump"):
-		return value.model_dump(mode="json")
-	if isinstance(value, dict):
-		return {str(k): _jsonable(v) for k, v in value.items()}
-	if isinstance(value, list):
-		return [_jsonable(v) for v in value]
-	if isinstance(value, tuple):
-		return [_jsonable(v) for v in value]
-	if isinstance(value, (str, int, float, bool)) or value is None:
-		return value
-	return str(value)
-
-
-def _build_converter(options: dict[str, Any], to_formats: list[str]) -> DocumentConverter:
-	pipeline_options = PdfPipelineOptions(
-		do_ocr=_as_bool(options.get("ocr", options.get("do_ocr")), True),
-		do_table_structure=_as_bool(options.get("do_table_structure"), True),
-		do_code_enrichment=_as_bool(options.get("do_code_enrichment"), False),
-		do_formula_enrichment=_as_bool(options.get("do_formula_enrichment"), False),
-		do_picture_classification=_as_bool(options.get("do_picture_classification"), False),
-		do_picture_description=_as_bool(options.get("do_picture_description"), False),
-		enable_remote_services=_as_bool(options.get("enable_remote_services"), False),
-	)
-
-	artifacts_path = _resolve_artifacts_path(options)
-	if artifacts_path is not None:
-		pipeline_options.artifacts_path = artifacts_path
-
-	timeout = _as_float(options.get("document_timeout"), None)
-	if timeout is not None:
-		pipeline_options.document_timeout = timeout
-
-	table_mode_raw = str(options.get("table_mode", TableFormerMode.ACCURATE.value)).lower()
-	table_mode = TableFormerMode.FAST if table_mode_raw == TableFormerMode.FAST.value else TableFormerMode.ACCURATE
-
-	if isinstance(pipeline_options.table_structure_options, TableStructureOptions):
-		pipeline_options.table_structure_options.mode = table_mode
-		pipeline_options.table_structure_options.do_cell_matching = _as_bool(
-			options.get("table_cell_matching"),
-			True,
-		)
-
-	ocr_engine = str(options.get("ocr_engine", "easyocr")).strip().lower() or "easyocr"
-	ocr_factory = get_ocr_factory(allow_external_plugins=_as_bool(options.get("allow_external_plugins"), False))
-	try:
-		ocr_options = ocr_factory.create_options(
-			kind=ocr_engine,
-			force_full_page_ocr=_as_bool(options.get("force_ocr"), False),
-		)
-	except RuntimeError:
-		logger.warning("Unsupported OCR engine '%s', falling back to 'auto'.", ocr_engine)
-		ocr_options = ocr_factory.create_options(
-			kind="auto",
-			force_full_page_ocr=_as_bool(options.get("force_ocr"), False),
-		)
-
-	ocr_lang = _as_list_of_str(options.get("ocr_lang"))
-	if ocr_lang is not None:
-		ocr_options.lang = ocr_lang
-
-	psm = _as_int(options.get("psm"), None)
-	if psm is not None and isinstance(ocr_options, (TesseractOcrOptions, TesseractCliOcrOptions)):
-		ocr_options.psm = psm
-
-	pipeline_options.ocr_options = ocr_options
-
-	image_mode = _normalize_image_mode(options.get("image_export_mode"))
-	if image_mode != ImageRefMode.PLACEHOLDER and any(
-		fmt not in _NO_IMAGE_EXPORT_FORMATS for fmt in to_formats
-	):
-		pipeline_options.generate_page_images = True
-		pipeline_options.generate_picture_images = True
-		pipeline_options.images_scale = _as_float(options.get("images_scale"), 2.0) or 2.0
-
-	backend_raw = str(options.get("pdf_backend", PdfBackend.DOCLING_PARSE.value)).lower()
-	backend: PdfBackend
-	try:
-		backend = normalize_pdf_backend(PdfBackend(backend_raw))
-	except ValueError:
-		logger.warning("Unsupported PDF backend '%s', falling back to docling_parse.", backend_raw)
-		backend = PdfBackend.DOCLING_PARSE
-
-	backend_cls = (
-		PyPdfiumDocumentBackend
-		if backend == PdfBackend.PYPDFIUM2
-		else DoclingParseDocumentBackend
-	)
-
-	return DocumentConverter(
-		format_options={
-			InputFormat.PDF: PdfFormatOption(
-				pipeline_options=pipeline_options,
-				backend=backend_cls,
-			),
-			InputFormat.IMAGE: ImageFormatOption(
-				pipeline_options=pipeline_options,
-			),
-		}
-	)
-
-
-def _save_html_to_string(document: Any, image_mode: ImageRefMode, split_page_view: bool) -> str:
-	with NamedTemporaryFile(mode="w", suffix=".html", delete=False, encoding="utf-8") as tmp:
-		path = Path(tmp.name)
-
-	try:
-		document.save_as_html(
-			filename=path,
-			image_mode=image_mode,
-			split_page_view=split_page_view,
-		)
-		return path.read_text(encoding="utf-8")
-	finally:
-		path.unlink(missing_ok=True)
-
-
-def _save_vtt_to_string(document: Any) -> str:
-	with NamedTemporaryFile(mode="w", suffix=".vtt", delete=False, encoding="utf-8") as tmp:
-		path = Path(tmp.name)
-
-	try:
-		document.save_as_vtt(filename=path)
-		return path.read_text(encoding="utf-8")
-	finally:
-		path.unlink(missing_ok=True)
-
-
-def _export_document(document: Any, to_formats: list[str], image_mode: ImageRefMode) -> dict[str, Any]:
-	content: dict[str, Any] = {
-		"md_content": None,
-		"json_content": None,
-		"yaml_content": None,
-		"html_content": None,
-		"html_split_page_content": None,
-		"text_content": None,
-		"doctags_content": None,
-		"vtt_content": None,
-	}
-
-	if OutputFormat.MARKDOWN.value in to_formats:
-		try:
-			content["md_content"] = document.export_to_markdown(image_mode=image_mode)
-		except TypeError:
-			content["md_content"] = document.export_to_markdown()
-
-	if OutputFormat.JSON.value in to_formats:
-		content["json_content"] = _jsonable(document.export_to_dict())
-
-	if OutputFormat.YAML.value in to_formats:
-		content["yaml_content"] = yaml.safe_dump(
-			document.export_to_dict(),
-			sort_keys=False,
-			allow_unicode=False,
-		)
-
-	if OutputFormat.HTML.value in to_formats:
-		try:
-			content["html_content"] = document.export_to_html(image_mode=image_mode)
-		except TypeError:
-			content["html_content"] = _save_html_to_string(
-				document=document,
-				image_mode=image_mode,
-				split_page_view=False,
-			)
-
-	if OutputFormat.HTML_SPLIT_PAGE.value in to_formats:
-		content["html_split_page_content"] = _save_html_to_string(
-			document=document,
-			image_mode=image_mode,
-			split_page_view=True,
-		)
-
-	if OutputFormat.TEXT.value in to_formats:
-		content["text_content"] = document.export_to_markdown(strict_text=True)
-
-	if OutputFormat.DOCTAGS.value in to_formats:
-		content["doctags_content"] = document.export_to_doctags()
-
-	if OutputFormat.VTT.value in to_formats:
-		content["vtt_content"] = _save_vtt_to_string(document=document)
-
-	return content
-
-
-def _build_single_base64_result(item: dict[str, Any], output_format: str) -> dict[str, Any]:
-	meta = _BASE64_EXPORT_META.get(output_format)
-	if meta is None:
-		raise ValueError(f"Output format '{output_format}' cannot be exported as a single base64 file.")
-
-	content_key, extension, content_type = meta
-	document = item.get("document", {})
-	content = document.get(content_key)
-	if content is None:
-		raise ValueError(f"No content available for format '{output_format}'.")
-
-	if content_key == "json_content":
-		text_payload = json.dumps(content, ensure_ascii=True, indent=2)
-	elif isinstance(content, str):
-		text_payload = content
-	else:
-		text_payload = str(content)
-
-	filename = f"{item.get('name', 'document')}.{extension}"
-	return {
-		"kind": "base64",
-		"format": output_format,
-		"content_type": content_type,
-		"filename": filename,
-		"file_base64": base64.b64encode(text_payload.encode("utf-8")).decode("ascii"),
-	}
-
-
-def _extract_information(
-	*,
-	extractor: Any,
-	source_input: Any,
-	headers: dict[str, str] | None,
-	template: str | dict[str, Any],
-	extract_kwargs: dict[str, Any],
-) -> dict[str, Any]:
-	_rewind_source_input(source_input)
-	result = extractor.extract(
-		source=source_input,
-		headers=headers,
-		template=template,
-		**extract_kwargs,
-	)
-
-	status = str(getattr(result.status, "value", result.status)).lower()
-	return {
-		"status": status,
-		"pages": _jsonable(getattr(result, "pages", [])),
-		"errors": _jsonable(getattr(result, "errors", [])),
-	}
-
-
-def _extraction_failure(message: str) -> dict[str, Any]:
-	return {
-		"status": "failure",
-		"pages": [],
-		"errors": [{"error_message": message}],
-	}
-
-
-def _source_failure(name: str, message: str, extraction_error: str | None = None) -> dict[str, Any]:
-	failure: dict[str, Any] = {
-		"name": name,
-		"document": {
-			"md_content": None,
-			"json_content": None,
-			"yaml_content": None,
-			"html_content": None,
-			"html_split_page_content": None,
-			"text_content": None,
-			"doctags_content": None,
-			"vtt_content": None,
-		},
-		"status": "failure",
-		"processing_time": 0.0,
-		"timings": {},
-		"errors": [{"error_message": message}],
-	}
-	if extraction_error is not None:
-		failure["extraction"] = _extraction_failure(extraction_error)
-	return failure
-
-
-def _status_summary(results: list[dict[str, Any]]) -> str:
-	if not results:
-		return "failure"
-
-	statuses = {str(item.get("status", "")).lower() for item in results}
-	if statuses == {"success"}:
-		return "success"
-	if statuses <= {"failure"}:
-		return "failure"
-	if "failure" in statuses:
-		return "partial_success"
-	return next(iter(statuses))
-
-
-def _write_zip_payload(results: list[dict[str, Any]]) -> str:
-	buffer = BytesIO()
-	with ZipFile(buffer, mode="w", compression=ZIP_DEFLATED) as zf:
-		manifest = []
-
-		for item in results:
-			base = item["name"]
-			document = item.get("document", {})
-			extraction = item.get("extraction")
-			status = item.get("status", "unknown")
-
-			if status != "failure":
-				if document.get("md_content") is not None:
-					zf.writestr(f"{base}.md", document["md_content"])
-				if document.get("json_content") is not None:
-					zf.writestr(
-						f"{base}.json",
-						json.dumps(document["json_content"], ensure_ascii=True, indent=2),
-					)
-				if document.get("yaml_content") is not None:
-					zf.writestr(f"{base}.yaml", document["yaml_content"])
-				if document.get("html_content") is not None:
-					zf.writestr(f"{base}.html", document["html_content"])
-				if document.get("html_split_page_content") is not None:
-					zf.writestr(
-						f"{base}.split_page.html",
-						document["html_split_page_content"],
-					)
-				if document.get("text_content") is not None:
-					zf.writestr(f"{base}.txt", document["text_content"])
-				if document.get("doctags_content") is not None:
-					zf.writestr(f"{base}.doctags", document["doctags_content"])
-				if document.get("vtt_content") is not None:
-					zf.writestr(f"{base}.vtt", document["vtt_content"])
-
-			if isinstance(extraction, dict):
-				zf.writestr(
-					f"{base}.extraction.json",
-					json.dumps(extraction, ensure_ascii=True, indent=2),
-				)
-
-			manifest.append(
-				{
-					"name": base,
-					"status": status,
-					"processing_time": item.get("processing_time", 0.0),
-					"extraction_status": extraction.get("status") if isinstance(extraction, dict) else None,
-					"errors": item.get("errors", []),
-				}
-			)
-
-		zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=True, indent=2))
-
-	return base64.b64encode(buffer.getvalue()).decode("ascii")
-
-
-def process_request(payload: dict[str, Any]) -> dict[str, Any]:
-	started = time.time()
-
-	sources = _normalize_sources(payload)
-	if not sources:
-		raise ValueError("No input sources provided. Use 'sources' with 'http' or 'file' items.")
-
-	options = payload.get("options") or {}
-	if not isinstance(options, dict):
-		raise ValueError("'options' must be an object.")
-
-	to_formats = _normalize_output_formats(options.get("to_formats"))
-	image_mode = _normalize_image_mode(options.get("image_export_mode"))
-	target_kind = _normalize_target_kind(payload)
-	abort_on_error = _as_bool(options.get("abort_on_error"), False)
-	extraction_options = _normalize_extraction_options(options)
-	extraction_enabled = extraction_options["enabled"]
-	extraction_template = extraction_options["template"]
-
-	if target_kind == "base64" and len(sources) != 1:
-		raise ValueError("target.kind='base64' requires exactly one source.")
-
-	if target_kind == "base64" and len(to_formats) != 1:
-		raise ValueError("target.kind='base64' requires exactly one format in options.to_formats.")
-
-	converter = _build_converter(options=options, to_formats=to_formats)
-	extractor = _build_extractor() if extraction_enabled else None
-
-	page_range = options.get("page_range")
-	convert_kwargs: dict[str, Any] = {"raises_on_error": False}
-	if isinstance(page_range, list) and len(page_range) == 2:
-		start_page = _as_int(page_range[0], None)
-		end_page = _as_int(page_range[1], None)
-		if start_page is not None and end_page is not None:
-			convert_kwargs["page_range"] = (start_page, end_page)
-
-	max_num_pages = _as_int(options.get("max_num_pages"), None)
-	if max_num_pages is not None:
-		convert_kwargs["max_num_pages"] = max_num_pages
-
-	max_file_size = _as_int(options.get("max_file_size"), None)
-	if max_file_size is not None:
-		convert_kwargs["max_file_size"] = max_file_size
-
-	extract_kwargs = dict(convert_kwargs)
-
-	results: list[dict[str, Any]] = []
-
-	for index, source in enumerate(sources, start=1):
-		name = _source_name(source, index)
-		source_start = time.time()
-
-		try:
-			source_input, headers, name = _prepare_source(source, index)
-
-			result = converter.convert(
-				source=source_input,
-				headers=headers,
-				**convert_kwargs,
-			)
-
-			status = str(getattr(result.status, "value", result.status)).lower()
-			source_response = {
-				"name": name,
-				"document": {
-					"md_content": None,
-					"json_content": None,
-					"yaml_content": None,
-					"html_content": None,
-					"html_split_page_content": None,
-					"text_content": None,
-					"doctags_content": None,
-					"vtt_content": None,
-				},
-				"status": status,
-				"processing_time": round(time.time() - source_start, 6),
-				"timings": _jsonable(getattr(result, "timings", {})),
-				"errors": _jsonable(getattr(result, "errors", [])),
-			}
-
-			if getattr(result, "document", None) is not None:
-				source_response["document"] = _export_document(
-					document=result.document,
-					to_formats=to_formats,
-					image_mode=image_mode,
-				)
-
-			if extraction_enabled and extractor is not None and extraction_template is not None:
-				try:
-					source_response["extraction"] = _extract_information(
-						extractor=extractor,
-						source_input=source_input,
-						headers=headers,
-						template=extraction_template,
-						extract_kwargs=extract_kwargs,
-					)
-				except Exception as exc:
-					logger.exception("Failed extracting information for source %s", name)
-					source_response["extraction"] = _extraction_failure(str(exc))
-
-			results.append(source_response)
-
-			if abort_on_error and status == "failure":
-				break
-
-		except Exception as exc:
-			logger.exception("Failed processing source %s", name)
-			fail_response = _source_failure(
-				name=name,
-				message=str(exc),
-				extraction_error=str(exc) if extraction_enabled else None,
-			)
-			fail_response["processing_time"] = round(time.time() - source_start, 6)
-			results.append(fail_response)
-			if abort_on_error:
-				break
-
-	processing_time = round(time.time() - started, 6)
-	overall_status = _status_summary(results)
-
-	if target_kind == "base64":
-		only = results[0]
-		response: dict[str, Any] = {
-			"status": only["status"],
-			"processing_time": processing_time,
-			"timings": only.get("timings", {}),
-			"errors": only.get("errors", []),
-		}
-		if "extraction" in only:
-			response["extraction"] = only["extraction"]
-		if only.get("status") != "failure":
-			response["result"] = _build_single_base64_result(
-				item=only,
-				output_format=to_formats[0],
-			)
-		return response
-
-	# Mimic /v1/convert/source in-body response whenever we have exactly one source
-	# and the target is not zip.
-	if len(results) == 1 and target_kind != "zip":
-		only = results[0]
-		response = {
-			"document": only["document"],
-			"status": only["status"],
-			"processing_time": processing_time,
-			"timings": only.get("timings", {}),
-			"errors": only.get("errors", []),
-		}
-		if "extraction" in only:
-			response["extraction"] = only["extraction"]
-		return response
-
-	zip_b64 = _write_zip_payload(results)
-
-	failed = [item for item in results if item.get("status") == "failure"]
-	succeeded = [item for item in results if item.get("status") != "failure"]
-
-	return {
-		"status": overall_status,
-		"processing_time": processing_time,
-		"num_converted": len(results),
-		"num_succeeded": len(succeeded),
-		"num_failed": len(failed),
-		"result": {
-			"kind": "zip",
-			"content_type": "application/zip",
-			"filename": "converted_docs.zip",
-			"zip_base64": zip_b64,
-		},
-		"errors": [
-			{
-				"source": item.get("name"),
-				"errors": item.get("errors", []),
-			}
-			for item in failed
-		],
-	}
-
-
-def handler(job: dict[str, Any]) -> dict[str, Any]:
-	payload = job.get("input") or {}
-	if not isinstance(payload, dict):
-		return {"error": "Job input must be a JSON object."}
-
-	# Allows clients to send {"payload": {...}} while still supporting direct bodies.
-	if "sources" not in payload and "payload" in payload and isinstance(payload["payload"], dict):
-		payload = payload["payload"]
-
-	try:
-		return process_request(payload)
-	except Exception as exc:
-		logger.exception("Job failed")
-		return {"error": str(exc)}
-
-
-runpod.serverless.start({"handler": handler})
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import ProxyHandler, Request, build_opener
+
+logger = logging.getLogger("docling_runpod")
+_TERMINAL = {"success", "partial_success", "failure", "skipped"}
+
+
+def configure_logging():
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        stream=sys.stdout,
+        force=True,
+    )
+
+
+def verify_ocr():
+    """Fail startup early if the promised OCR backends cannot be imported."""
+    for name in ("tesserocr", "rapidocr", "easyocr"):
+        module = importlib.import_module(name)
+        logger.info("OCR backend=%s version=%s import=ok", name, importlib.metadata.version(name))
+        if name == "tesserocr":
+            path, languages = module.get_languages()
+            logger.info("Tesseract tessdata=%s languages=%s", path, languages)
+            if "eng" not in languages:
+                raise RuntimeError("Tesseract English language data is missing")
+    for name in ("docling-serve", "docling", "runpod"):
+        logger.info("Dependency %s=%s", name, importlib.metadata.version(name))
+
+
+class ServiceError(RuntimeError):
+    def __init__(self, status):
+        super().__init__(f"Docling Serve HTTP {status}; inspect service logs for details")
+        self.status = status
+
+
+class DoclingService:
+    def __init__(self):
+        self.port = int(os.getenv("DOCLING_RUNPOD_PORT", "5001"))
+        self.url = f"http://127.0.0.1:{self.port}"
+        self.startup_timeout = float(os.getenv("DOCLING_RUNPOD_STARTUP_TIMEOUT", "600"))
+        self.job_timeout = float(os.getenv("DOCLING_RUNPOD_JOB_TIMEOUT", "3600"))
+        self.poll_interval = float(os.getenv("DOCLING_RUNPOD_POLL_INTERVAL", "2"))
+        if min(self.startup_timeout, self.job_timeout, self.poll_interval) <= 0:
+            raise ValueError("Worker timeouts and poll interval must be positive")
+        self.process = None
+        # One conversion at a time: restarting after timeout must not kill another job.
+        self.lock = threading.RLock()
+        self.opener = build_opener(ProxyHandler({}))
+
+    def request(self, path, payload=None, timeout=30):
+        headers = {"Accept": "application/json"}
+        if os.getenv("DOCLING_SERVE_API_KEY"):
+            headers["X-Api-Key"] = os.environ["DOCLING_SERVE_API_KEY"]
+        data = None
+        if payload is not None:
+            data = json.dumps(payload).encode()
+            headers["Content-Type"] = "application/json"
+        request = Request(self.url + path, data=data, headers=headers)
+        try:
+            with self.opener.open(request, timeout=timeout) as response:
+                body = response.read()
+                if response.headers.get_content_type() == "application/zip":
+                    return {"filename": "result.zip", "mime_type": "application/zip",
+                            "base64_string": base64.b64encode(body).decode("ascii")}
+                return json.loads(body)
+        except HTTPError as exc:
+            # Validation responses can contain entire base64 inputs or credentials.
+            status = exc.code
+            exc.close()
+            raise ServiceError(status) from None
+
+    def stop(self):
+        with self.lock:
+            process, self.process = self.process, None
+            if process is not None and process.poll() is None:
+                logger.info("Stopping Docling Serve pid=%s", process.pid)
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+
+    def start(self):
+        with self.lock:
+            if self.process is not None and self.process.poll() is None:
+                return
+            env = os.environ.copy()
+            env.update(PYTHONUNBUFFERED="1", DOCLING_SERVE_ENABLE_UI="false",
+                       DOCLING_SERVE_ENG_KIND="local", UVICORN_ROOT_PATH="",
+                       UVICORN_RELOAD="false")
+            env.setdefault("DOCLING_SERVE_LOG_LEVEL", os.getenv("LOG_LEVEL", "INFO"))
+            # Inherit stdout/stderr so native libraries and the service reach RunPod logs.
+            self.process = subprocess.Popen(
+                [sys.executable, "-u", "-m", "docling_serve", "run",
+                 "--host", "127.0.0.1", "--port", str(self.port), "--workers", "1"],
+                env=env, start_new_session=True,
+            )
+            logger.info("Starting Docling Serve pid=%s", self.process.pid)
+            deadline = time.monotonic() + self.startup_timeout
+            try:
+                while time.monotonic() < deadline:
+                    if self.process.poll() is not None:
+                        raise RuntimeError(f"Docling Serve exited with code {self.process.returncode}")
+                    try:
+                        self.request("/ready", timeout=min(2, max(.1, deadline - time.monotonic())))
+                        logger.info("Docling Serve ready")
+                        return
+                    except (URLError, TimeoutError, ServiceError):
+                        time.sleep(1)
+                raise TimeoutError("Docling Serve startup timed out")
+            except BaseException:
+                self.stop()
+                raise
+
+    def convert(self, payload, job_id):
+        with self.lock:
+            self.start()
+            deadline = time.monotonic() + self.job_timeout
+            def request(path, data=None):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Docling conversion exceeded DOCLING_RUNPOD_JOB_TIMEOUT")
+                if self.process.poll() is not None:
+                    raise RuntimeError("Docling Serve exited during conversion")
+                return self.request(path, data, timeout=min(30, remaining))
+            try:
+                task = request("/v1/convert/source/async", payload)
+                task_id = quote(task["task_id"], safe="")
+                previous = None
+                last_log = 0
+                while True:
+                    progress = (task["task_status"], task.get("task_meta"))
+                    now = time.monotonic()
+                    if progress != previous or now - last_log >= 30:
+                        logger.info("job=%s task=%s status=%s progress=%s", job_id,
+                                    task_id, progress[0], progress[1])
+                        previous, last_log = progress, now
+                    if task["task_status"] in _TERMINAL:
+                        break
+                    time.sleep(min(self.poll_interval, max(0, deadline - now)))
+                    task = request(f"/v1/status/poll/{task_id}")
+                result = request(f"/v1/result/{task_id}")
+                if task["task_status"] in {"failure", "skipped"}:
+                    return {"error": "Docling conversion " + task["task_status"],
+                            "task_id": task_id, "result": result}
+                return result
+            except ServiceError:
+                raise
+            except Exception:
+                # No reliable cancellation API: stop timed-out/uncertain work before reuse.
+                self.stop()
+                raise
+
+
+def prepare_payload(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Job input must be a Docling Serve conversion request object")
+    payload = dict(payload)
+    if not isinstance(payload.get("sources"), list) or not payload["sources"]:
+        raise ValueError("input.sources must be a non-empty list")
+    target = payload.setdefault("target", {"kind": "inbody"})
+    if not isinstance(target, dict):
+        raise ValueError("input.target must be an object")
+    if target.get("kind") == "presigned_url":
+        raise ValueError("presigned_url points to worker-local storage; use inbody, zip, or an external storage target")
+    return payload
+
+
+service = DoclingService()
+atexit.register(service.stop)
+
+
+def handler(job):
+    job_id = str(job.get("id", "local"))
+    started = time.monotonic()
+    logger.info("job=%s received", job_id)
+    try:
+        result = service.convert(prepare_payload(job.get("input")), job_id)
+        logger.info("job=%s finished elapsed=%.2fs error=%s", job_id,
+                    time.monotonic() - started, "error" in result)
+        return result
+    except (ValueError, ServiceError) as exc:
+        logger.warning("job=%s rejected: %s", job_id, exc)
+        return {"error": str(exc)}
+    except Exception:
+        logger.exception("job=%s conversion failed elapsed=%.2fs", job_id,
+                         time.monotonic() - started)
+        return {"error": "Docling worker failed; inspect worker logs", "job_id": job_id}
+
+
+def main():
+    configure_logging()
+    verify_ocr()
+    service.start()
+    import runpod
+    try:
+        runpod.serverless.start({"handler": handler})
+    finally:
+        service.stop()
+
+
+if __name__ == "__main__":
+    main()
