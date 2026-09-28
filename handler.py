@@ -43,10 +43,49 @@ def verify_ocr():
         logger.info("Dependency %s=%s", name, importlib.metadata.version(name))
 
 
+def error_details(value, payload=None):
+    """Keep diagnostics without echoing document bytes or request credentials."""
+    sensitive_keys = {"input", "base64_string", "headers", "authorization", "api_key",
+                      "x_api_key", "password", "secret", "token", "access_token",
+                      "access_key", "secret_key", "secret_access_key"}
+    secrets = set()
+    api_key = os.getenv("DOCLING_SERVE_API_KEY")
+    if api_key:
+        secrets.add(api_key)
+
+    def collect(item, sensitive=False):
+        if isinstance(item, dict):
+            for key, child in item.items():
+                collect(child, sensitive or key.lower().replace("-", "_") in sensitive_keys)
+        elif isinstance(item, list):
+            for child in item:
+                collect(child, sensitive)
+        elif sensitive and isinstance(item, str) and item:
+            secrets.add(item)
+
+    collect(payload)
+
+    def redact(item):
+        if isinstance(item, dict):
+            return {key: "[redacted]" if key.lower().replace("-", "_") in sensitive_keys
+                    else redact(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [redact(child) for child in item]
+        if isinstance(item, str):
+            for secret in sorted(secrets, key=len, reverse=True):
+                item = item.replace(secret, "[redacted]")
+        return item
+
+    return redact(value)
+
+
 class ServiceError(RuntimeError):
-    def __init__(self, status):
-        super().__init__(f"Docling Serve HTTP {status}; inspect service logs for details")
+    def __init__(self, status, path, details):
+        super().__init__(f"Docling Serve HTTP {status} at {path}: "
+                         + json.dumps(details, ensure_ascii=False))
         self.status = status
+        self.path = path
+        self.details = details
 
 
 class DoclingService:
@@ -80,10 +119,16 @@ class DoclingService:
                             "base64_string": base64.b64encode(body).decode("ascii")}
                 return json.loads(body)
         except HTTPError as exc:
-            # Validation responses can contain entire base64 inputs or credentials.
-            status = exc.code
-            exc.close()
-            raise ServiceError(status) from None
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+                try:
+                    details = json.loads(body)
+                except ValueError:
+                    details = body or str(exc.reason)
+                details = error_details(details, payload)
+            finally:
+                exc.close()
+            raise ServiceError(exc.code, path, details) from None
 
     def stop(self):
         with self.lock:
@@ -196,13 +241,18 @@ def handler(job):
         logger.info("job=%s finished elapsed=%.2fs error=%s", job_id,
                     time.monotonic() - started, "error" in result)
         return result
-    except (ValueError, ServiceError) as exc:
+    except ServiceError as exc:
+        logger.warning("job=%s rejected: %s", job_id, exc)
+        return {"error": str(exc), "status_code": exc.status,
+                "path": exc.path, "details": exc.details, "job_id": job_id}
+    except ValueError as exc:
         logger.warning("job=%s rejected: %s", job_id, exc)
         return {"error": str(exc)}
-    except Exception:
+    except Exception as exc:
         logger.exception("job=%s conversion failed elapsed=%.2fs", job_id,
                          time.monotonic() - started)
-        return {"error": "Docling worker failed; inspect worker logs", "job_id": job_id}
+        details = error_details(str(exc), job.get("input"))
+        return {"error": f"Docling worker {type(exc).__name__}: {details}", "job_id": job_id}
 
 
 def main():

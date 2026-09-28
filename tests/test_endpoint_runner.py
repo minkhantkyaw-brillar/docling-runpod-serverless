@@ -54,8 +54,11 @@ class RunnerTests(unittest.TestCase):
             (folder / 'b.xlsx').touch()
             cases = cases_for(folder)
             ocr = [case for case in cases if case.name.startswith('ocr-') and case.check == 'text']
-            self.assertEqual({c.options['ocr_engine'] for c in ocr},
-                             {'tesseract', 'rapidocr', 'easyocr', 'tesseract_cli'})
+            self.assertEqual({c.options['ocr_preset'] for c in ocr},
+                             {'tesserocr', 'rapidocr', 'easyocr', 'tesseract'})
+            for case in ocr:
+                expected = 'eng' if case.options['ocr_preset'] in {'tesserocr', 'tesseract'} else 'en'
+                self.assertEqual(case.options['ocr_lang'], [expected])
             self.assertTrue(all(c.raster and c.options['force_ocr'] for c in ocr))
             self.assertEqual(len({c.name for c in cases}), len(cases))
 

@@ -49,10 +49,15 @@ def cases_for(folder, extended=False):
         raise ValueError("Source directory must contain at least one PDF")
     cases = [Case(f"baseline-{i}", p, {"to_formats": ["md", "json"]}) for i, p in enumerate(files)]
     for i, pdf in enumerate(pdfs):
-        for engine in ("tesseract", "rapidocr", "easyocr", "tesseract_cli"):
+        for engine, preset, language in (
+            ("tesseract", "tesserocr", "eng"),
+            ("rapidocr", "rapidocr", "en"),
+            ("easyocr", "easyocr", "en"),
+            ("tesseract_cli", "tesseract", "eng"),
+        ):
             cases.append(Case(f"ocr-{engine}-{i}", pdf,
                 {"to_formats": ["md", "json"], "do_ocr": True, "force_ocr": True,
-                 "ocr_engine": engine, "ocr_lang": ["en"], "do_table_structure": False}, raster=True))
+                 "ocr_preset": preset, "ocr_lang": [language], "do_table_structure": False}, raster=True))
     pdf = pdfs[0]
     cases += [
         Case("ocr-disabled-control", pdf, {"do_ocr": False, "do_table_structure": False,
@@ -70,7 +75,7 @@ def cases_for(folder, extended=False):
              "include_images": True, "images_scale": 1.0}, check="image"),
         Case("referenced-zip", pdf, {"page_range": [1, 1], "to_formats": ["md", "json"],
              "image_export_mode": "referenced", "include_page_images": True}, target="zip", check="zip"),
-        Case("invalid-ocr", pdf, {"ocr_engine": "INVALID_BACKEND"}, check="rejected"),
+        Case("invalid-ocr", pdf, {"ocr_preset": "INVALID_BACKEND"}, check="rejected"),
         Case("invalid-format", pdf, {"to_formats": ["INVALID_FORMAT"]}, check="rejected"),
         Case("invalid-page-range", pdf, {"page_range": [0, 0]}, check="rejected"),
         Case("reuse-after-errors", pdf, {"page_range": [1, 1]}),
