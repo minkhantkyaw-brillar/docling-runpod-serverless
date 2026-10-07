@@ -17,7 +17,7 @@ ENV DOCLING_SERVE_ALLOW_CUSTOM_OCR_CONFIG=true \
 
 RUN echo "Set TESSDATA_PREFIX=${TESSDATA_PREFIX}"
 
-RUN docling-tools models download layout tableformer tableformerv2 code_formula picture_classifier smolvlm granitedocling smoldocling granite_vision granite_chart_extraction rapidocr easyocr docling-layout-egret-xlarge docling-layout-egret-medium
+RUN docling-tools models download layout tableformer tableformerv2 code_formula picture_classifier smolvlm granitedocling smoldocling granite_vision granite_chart_extraction rapidocr easyocr docling-layout-egret-xlarge docling-layout-egret-medium heron-101
 RUN python -m pip install --no-cache-dir runpod pyyaml docling[easyocr,rapidocr] tesserocr onnxruntime
 
 USER 1001
